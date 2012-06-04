@@ -9,16 +9,15 @@ import sys
 import traceback
 import zmq
 
-class ZBaseServer(object):
-	serializer = pickle
+class ZBaseSocket(object):
 	sock_opt = []
-	sock_bind = True
-	runner = None
+	sock_bind = False
+	socket_type = None
 
-	def __init__(self, address, methods=None, logger_name='zrpc.ZServer'):
+	def __init__(self, address, logger_name='zrpc.ZBaseSocket'):
 		self.logger = logging.getLogger(logger_name)
 		ctx = zmq.Context.instance()
-		self.sock = ctx.socket(zmq.REP)
+		self.sock = ctx.socket(self.socket_type)
 		for option in self.sock_opt:
 			self.sock.setsockopt(*option)
 		if self.sock_bind:
@@ -27,6 +26,16 @@ class ZBaseServer(object):
 		else:
 			self.logger.debug('Connecting to: %s', address)
 			self.sock.connect(address)
+
+class ZBaseServer(ZBaseSocket):
+	serializer = pickle
+	sock_opt = []
+	sock_bind = True
+	socket_type = zmq.REP
+	runner = None
+
+	def __init__(self, address, methods=None, logger_name='zrpc.ZBaseServer'):
+		ZBaseSocket.__init__(self, address, logger_name=logger_name)
 		self.methods = methods or {}
 		self.methods['list_functions'] = self._list_methods
 		self.methods['documentation'] = self._get_doc
@@ -94,47 +103,6 @@ class ZBaseServer(object):
 		else:
 			self._run()
 
-class ZWorker(ZBaseServer):
-	"""
-	ZWorker allows executing functions in a more 'fire-and-forget' way.
-	A response is returned right away, then the remote function is executed
-	"""
-	sock_bind = False
-
-	def __init__(self, address, methods=None):
-		ZBaseServer.__init__(self, address, methods=methods, logger_name='zrpc.ZWorker')
-
-	def _execute_async(self, func, args, kwargs):
-		self.sock.send_pyobj({'status': True, 'result': True})
-		try:
-			results = func(*args, **kwargs)
-		except Exception, error:
-			formatted_traceback = traceback.format_exc()
-			self.logger.error(
-				'%s%s',
-				traceback.format_exception_only(error.__class__, error)[0],
-				''.join(formatted_traceback)
-			)
-
-	def _run(self):
-		while True:
-			func_name, args, kwargs = self.get_message()
-			if func_name == 'kill_server':
-				self.sock.send_pyobj({'status': True, 'result': True})
-				self.sock.close()
-				break
-			elif func_name in ['list_functions', 'documentation', 'echo']:
-				# These commands must be executed normally
-				func = self.methods[func_name]
-				self._execute_with_tracebacks(func, args, kwargs)
-				continue
-			try:
-				func = self.methods[func_name]
-			except KeyError:
-				self.sock.send_pyobj({'status': None, 'result': None})
-			else:
-				self._execute_async(func, args, kwargs)
-
 class ZRPCServer(ZBaseServer):
 	def __init__(self, address, methods=None):
 		ZBaseServer.__init__(self, address, methods=methods, logger_name='zrpc.ZRPCServer')
@@ -153,23 +121,14 @@ class ZRPCServer(ZBaseServer):
 			else:
 				self._execute_with_tracebacks(func, args, kwargs)
 
-class ZRPCClient(object):
+class ZRPCClient(ZBaseSocket):
 	serializer = pickle
 	sock_opt = []
 	sock_bind = False
+	socket_type = zmq.REQ
 
 	def __init__(self, address):
-		self.logger = logging.getLogger('zrpc.ZRPCClient')
-		ctx = zmq.Context.instance()
-		self.sock = ctx.socket(zmq.REQ)
-		for option in self.sock_opt:
-			self.sock.setsockopt(*option)
-		if self.sock_bind:
-			self.logger.debug('Binding to: %s', address)
-			self.sock.bind(address)
-		else:
-			self.logger.debug('Connecting to: %s', address)
-			self.sock.connect(address)
+		ZBaseSocket.__init__(self, address, logger_name='zrpc.ZRPCClient')
 
 	def _call(self, method, *args, **kwargs):
 		self.sock.send_multipart([method, self.serializer.dumps(args), self.serializer.dumps(kwargs)])
@@ -201,6 +160,58 @@ class ZRPCClient(object):
 					raise result
 			return result
 		return rpc_call
+
+class ZWorker(ZBaseServer):
+	"""
+	ZWorker allows executing functions in a more 'fire-and-forget' way.
+	A response is returned right away, then the remote function is executed
+	"""
+	socket_type = zmq.PULL
+	sock_bind = False
+
+	def __init__(self, address, methods=None):
+		ZBaseServer.__init__(self, address, methods=methods, logger_name='zrpc.ZWorker')
+
+	def _execute_async(self, func, args, kwargs):
+		try:
+			results = func(*args, **kwargs)
+		except Exception, error:
+			formatted_traceback = traceback.format_exc()
+			self.logger.error(
+				'%s%s',
+				traceback.format_exception_only(error.__class__, error)[0],
+				''.join(formatted_traceback)
+			)
+		else:
+			self.logger.debug("%s(*%r, **%r) -> %r", func_name, args, kwargs, results)
+
+	def _run(self):
+		while True:
+			func_name, args, kwargs = self.get_message()
+			if func_name == 'kill_server':
+				self.sock.close()
+				break
+			try:
+				func = self.methods[func_name]
+			except KeyError:
+				pass
+			else:
+				self._execute_async(func, args, kwargs)
+
+class ZMaster(ZBaseSocket):
+	serializer = pickle
+	sock_opt = []
+	sock_bind = False
+	socket_type = zmq.PUSH
+
+	def __init__(self, address):
+		ZBaseSocket.__init__(self, address, logger_name='zrpc.ZRPCClient')
+
+	def _call(self, method, *args, **kwargs):
+		self.sock.send_multipart([method, self.serializer.dumps(args), self.serializer.dumps(kwargs)])
+
+	def __getattr__(self, method):
+		self._call(method, *args, **kwargs)
 
 
 def demonstration():
