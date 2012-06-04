@@ -13,3 +13,4 @@ TODO
 - More documentation  
 - Unit tests  
 - Improve remote exception logging  
+- Reraise NotImplementedError on client side for missing functions?

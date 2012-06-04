@@ -9,14 +9,14 @@ import sys
 import traceback
 import zmq
 
-class ZRPCServer(object):
+class ZBaseServer(object):
 	serializer = pickle
 	sock_opt = []
 	sock_bind = True
 	runner = None
 
-	def __init__(self, address, methods=None):
-		self.logger = logging.getLogger('zrpc.ZRPCServer')
+	def __init__(self, address, methods=None, logger_name='zrpc.ZServer'):
+		self.logger = logging.getLogger(logger_name)
 		ctx = zmq.Context.instance()
 		self.sock = ctx.socket(zmq.REP)
 		for option in self.sock_opt:
@@ -30,12 +30,19 @@ class ZRPCServer(object):
 		self.methods = methods or {}
 		self.methods['list_functions'] = self._list_methods
 		self.methods['documentation'] = self._get_doc
+		self.methods['echo'] = self._echo
 
 	def _list_methods(self):
 		"""
 		Retrieve list of functions supported by the server
 		"""
 		return self.methods.keys()
+
+	def _echo(self, statement):
+		"""
+		Echo input
+		"""
+		return statement
 
 	def _get_doc(self, func_name):
 		"""
@@ -53,16 +60,88 @@ class ZRPCServer(object):
 			documentation = pydoc.render_doc(func, title='%s')
 			return documentation
 
+	def _execute_with_tracebacks(self, func, args, kwargs):
+		try:
+			results = func(*args, **kwargs)
+		except Exception, error:
+			formatted_traceback = traceback.format_exc()
+			self.logger.error(
+				'%s%s',
+				traceback.format_exception_only(error.__class__, error)[0],
+				''.join(formatted_traceback)
+			)
+			self.sock.send_pyobj({'status': False, 'result': (error, formatted_traceback)})
+		else:
+			self.sock.send_pyobj({'status': True, 'result': results})
+
+	def _run(self):
+		raise NotImplementedError
+
 	def add_function(self, func_name, function):
 		self.methods[func_name] = function
 
 	def remove_function(self, func_name):
 		self.methods.pop(func_name, None)
 
+	def get_message(self):
+		message = self.sock.recv_multipart()
+		func_name, args, kwargs = message[0], self.serializer.loads(message[1]), self.serializer.loads(message[2])
+		return (func_name, args, kwargs)
+
+	def start(self):
+		if self.runner:
+			self.runner(self._run)
+		else:
+			self._run()
+
+class ZWorker(ZBaseServer):
+	"""
+	ZWorker allows executing functions in a more 'fire-and-forget' way.
+	A response is returned right away, then the remote function is executed
+	"""
+	sock_bind = False
+
+	def __init__(self, address, methods=None):
+		ZBaseServer.__init__(self, address, methods=methods, logger_name='zrpc.ZWorker')
+
+	def _execute_async(self, func, args, kwargs):
+		self.sock.send_pyobj({'status': True, 'result': True})
+		try:
+			results = func(*args, **kwargs)
+		except Exception, error:
+			formatted_traceback = traceback.format_exc()
+			self.logger.error(
+				'%s%s',
+				traceback.format_exception_only(error.__class__, error)[0],
+				''.join(formatted_traceback)
+			)
+
 	def _run(self):
 		while True:
-			message = self.sock.recv_multipart()
-			func_name, args, kwargs = message[0], self.serializer.loads(message[1]), self.serializer.loads(message[2])
+			func_name, args, kwargs = self.get_message()
+			if func_name == 'kill_server':
+				self.sock.send_pyobj({'status': True, 'result': True})
+				self.sock.close()
+				break
+			elif func_name in ['list_functions', 'documentation', 'echo']:
+				# These commands must be executed normally
+				func = self.methods[func_name]
+				self._execute_with_tracebacks(func, args, kwargs)
+				continue
+			try:
+				func = self.methods[func_name]
+			except KeyError:
+				self.sock.send_pyobj({'status': None, 'result': None})
+			else:
+				self._execute_async(func, args, kwargs)
+
+class ZRPCServer(ZBaseServer):
+	def __init__(self, address, methods=None):
+		ZBaseServer.__init__(self, address, methods=methods, logger_name='zrpc.ZRPCServer')
+
+	def _run(self):
+		while True:
+			func_name, args, kwargs = self.get_message()
 			if func_name == 'kill_server':
 				self.sock.send_pyobj({'status': True, 'result': True})
 				self.sock.close()
@@ -71,24 +150,8 @@ class ZRPCServer(object):
 				func = self.methods[func_name]
 			except KeyError:
 				self.sock.send_pyobj({'status': None, 'result': None})
-			try:
-				results = func(*args, **kwargs)
-			except Exception, error:
-				formatted_traceback = traceback.format_exc()
-				self.logger.error(
-					'%s%s',
-					traceback.format_exception_only(error.__class__, error)[0],
-					''.join(formatted_traceback)
-				)
-				self.sock.send_pyobj({'status': False, 'result': (error, formatted_traceback)})
 			else:
-				self.sock.send_pyobj({'status': True, 'result': results})
-
-	def start(self):
-		if self.runner:
-			self.runner(self._run)
-		else:
-			self._run()
+				self._execute_with_tracebacks(func, args, kwargs)
 
 class ZRPCClient(object):
 	serializer = pickle
@@ -188,6 +251,16 @@ def demonstration():
 	print client.echo('Hello World')
 
 	print '*' * 80
+	print "\nCall to undefined remote function"
+	print '=' * 80
+	try:
+		client.spam()
+	except NotImplementedError:
+		print "Caught remote exception"
+		print traceback.format_exc()
+	else:
+		print "Error was ignored"
+
 	print "\nCall causes error which is suppressed"
 	print '=' * 80
 	try:
